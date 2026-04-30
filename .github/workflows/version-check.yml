@@ -1,0 +1,45 @@
+name: Version Check
+
+on: [pull_request]
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version consistency
+        env:
+          HAS_RELEASE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'release') }}
+        run: |
+          set -euo pipefail
+
+          # Extract versions
+          TOML_VERSION=$(grep -m1 '^version' python/pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
+          PY_VERSION=$(grep '__version__' python/sgl_jax/version.py | sed 's/.*"\(.*\)".*/\1/')
+
+          echo "pyproject.toml version: $TOML_VERSION"
+          echo "version.py version:     $PY_VERSION"
+
+          # Check consistency
+          if [ "$TOML_VERSION" != "$PY_VERSION" ]; then
+            echo "::error::Version mismatch: pyproject.toml has '$TOML_VERSION' but version.py has '$PY_VERSION'"
+            exit 1
+          fi
+          echo "Versions are consistent: $TOML_VERSION"
+
+          # Check if version files were changed without release label
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- python/pyproject.toml python/sgl_jax/version.py || true)
+          if [ -n "$CHANGED" ]; then
+            echo "Version files changed: $CHANGED"
+            if [ "$HAS_RELEASE_LABEL" != "true" ]; then
+              echo "::error::Version files were changed but this PR does not have the 'release' label. Either add the 'release' label (if this is a release PR) or revert version changes."
+              exit 1
+            fi
+            echo "Release label present - version change is authorized."
+          else
+            echo "No version files changed."
+          fi

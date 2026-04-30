@@ -1,0 +1,101 @@
+name: Release Prep
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to tag (must match pyproject.toml and version.py on main)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  create-release-tag:
+    # For PR events: only run if merged to main with release label
+    # For workflow_dispatch: always run
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       github.event.pull_request.base.ref == 'main' &&
+       contains(github.event.pull_request.labels.*.name, 'release'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify repository
+        run: |
+          # Fork: change to 'sgl-project/sglang-jax' when upstreaming
+          EXPECTED_REPO="zhengkezhou1/sglang-jax"
+          if [ "${{ github.repository }}" != "$EXPECTED_REPO" ]; then
+            echo "::error::This workflow should only run on $EXPECTED_REPO, not ${{ github.repository }}"
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Validate versions and create tag
+        run: |
+          set -euo pipefail
+
+          # --- Extract versions ---
+          TOML_VERSION=$(grep -m1 '^version' python/pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
+          PY_VERSION=$(grep '__version__' python/sgl_jax/version.py | sed 's/.*"\(.*\)".*/\1/')
+
+          echo "pyproject.toml version: $TOML_VERSION"
+          echo "version.py version:     $PY_VERSION"
+
+          if [ "$TOML_VERSION" != "$PY_VERSION" ]; then
+            echo "::error::Version mismatch: pyproject.toml='$TOML_VERSION' vs version.py='$PY_VERSION'"
+            exit 1
+          fi
+
+          # --- Cross-check with workflow_dispatch input ---
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "$TOML_VERSION" != "${{ inputs.version }}" ]; then
+              echo "::error::Input version '${{ inputs.version }}' != pyproject.toml '$TOML_VERSION'"
+              exit 1
+            fi
+          fi
+
+          TAG_NAME="v${TOML_VERSION}"
+          echo "Target tag: $TAG_NAME"
+
+          # --- Check tag doesn't exist ---
+          if git rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG_NAME already exists"
+            exit 1
+          fi
+
+          # --- Compare with last release ---
+          LAST_TAG=$(git tag -l 'v*' --sort=-version:refname | head -1)
+          if [ -n "$LAST_TAG" ]; then
+            LAST_VERSION="${LAST_TAG#v}"
+            echo "Last release: $LAST_VERSION"
+
+            # sort -V handles X.Y.Z correctly; rcN comparison has known limitations
+            HIGHER=$(printf '%s\n%s' "$LAST_VERSION" "$TOML_VERSION" | sort -V | tail -1)
+            if [ "$HIGHER" = "$LAST_VERSION" ] || [ "$TOML_VERSION" = "$LAST_VERSION" ]; then
+              echo "::error::New version ($TOML_VERSION) must be greater than last release ($LAST_VERSION)"
+              exit 1
+            fi
+            echo "Version check passed: $TOML_VERSION > $LAST_VERSION"
+          else
+            echo "No previous release tags found. First release."
+          fi
+
+          # --- Create annotated tag ---
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG_NAME" -m "sglang-jax ${TAG_NAME}"
+          git push origin "$TAG_NAME"
+          echo "Successfully created and pushed tag $TAG_NAME"

@@ -1,3 +1,4 @@
+# Ensures version consistency across pyproject.toml and version.py
 name: Version Check
 
 on: [pull_request]

@@ -120,13 +120,30 @@ def create_mimo_vision_weight_mappings(
     config,
     source_prefix: str = "visual",
     target_prefix: str = "",
+    tp_size: int = 1,
 ) -> dict[str, WeightMapping]:
     from sgl_jax.srt.utils.weight_utils import WeightMapping
+
+    num_heads = int(config.num_heads)
+    num_kv_heads = int(getattr(config, "num_key_value_heads", config.num_heads))
+    head_dim = int(config.qk_channels)
+    kv_head_replicas = (tp_size + num_kv_heads - 1) // num_kv_heads if tp_size > num_kv_heads else 1
+    physical_num_kv_heads = num_kv_heads * kv_head_replicas
+    if num_heads % tp_size != 0 or physical_num_kv_heads % tp_size != 0:
+        raise ValueError(
+            "MiMo vision Q/KV heads cannot be distributed over tensor parallel size: "
+            f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, tp_size={tp_size}."
+        )
+    q_size = num_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    qkv_split_sizes = (q_size, kv_size, kv_size)
+    qkv_split_replicas = (1, kv_head_replicas, kv_head_replicas)
 
     mappings: dict[str, WeightMapping] = {
         f"{source_prefix}.patch_embed.proj.weight": WeightMapping(
             target_path=f"{target_prefix}patch_embed.proj.kernel",
             transpose_axes=CONV3D_TORCH_TO_JAX,
+            sharding=(None, None, None, None, None),
         ),
         f"{source_prefix}.merger.ln_q.weight": WeightMapping(
             target_path=f"{target_prefix}merger.ln_q.scale",
@@ -135,11 +152,13 @@ def create_mimo_vision_weight_mappings(
         # merger ln_q / mlp are bias-free in the checkpoint (no .bias keys); the merger
         # module is built with use_bias=False to match.
         f"{source_prefix}.merger.mlp.0.weight": WeightMapping(
-            target_path=f"{target_prefix}merger.mlp_fc1.kernel",
+            target_path=f"{target_prefix}merger.mlp_fc1.weight",
+            sharding=(None, "tensor"),
             transpose=True,
         ),
         f"{source_prefix}.merger.mlp.2.weight": WeightMapping(
-            target_path=f"{target_prefix}merger.mlp_fc2.kernel",
+            target_path=f"{target_prefix}merger.mlp_fc2.weight",
+            sharding=("tensor", None),
             transpose=True,
         ),
     }
@@ -151,55 +170,74 @@ def create_mimo_vision_weight_mappings(
             {
                 f"{source}.norm1.weight": WeightMapping(
                     target_path=f"{target}.norm1.scale",
-                    sharding=(),
+                    sharding=(None,),
                 ),
                 f"{source}.norm2.weight": WeightMapping(
                     target_path=f"{target}.norm2.scale",
-                    sharding=(),
+                    sharding=(None,),
                 ),
                 f"{source}.attn.qkv.weight": WeightMapping(
-                    target_path=f"{target}.attn.qkv.kernel",
+                    target_path=[
+                        f"{target}.attn.q_proj.weight",
+                        f"{target}.attn.k_proj.weight",
+                        f"{target}.attn.v_proj.weight",
+                    ],
+                    sharding=(None, "tensor"),
                     transpose=True,
+                    qkv_split_sizes=qkv_split_sizes,
+                    qkv_split_replicas=qkv_split_replicas,
+                    qkv_head_dim=head_dim,
                 ),
                 f"{source}.attn.qkv.bias": WeightMapping(
-                    target_path=f"{target}.attn.qkv.bias",
-                    sharding=(),
+                    target_path=[
+                        f"{target}.attn.q_proj.bias",
+                        f"{target}.attn.k_proj.bias",
+                        f"{target}.attn.v_proj.bias",
+                    ],
+                    sharding=("tensor",),
+                    qkv_split_sizes=qkv_split_sizes,
+                    qkv_split_replicas=qkv_split_replicas,
+                    qkv_head_dim=head_dim,
                 ),
                 f"{source}.attn.proj.weight": WeightMapping(
-                    target_path=f"{target}.attn.proj.kernel",
+                    target_path=f"{target}.attn.proj.weight",
+                    sharding=("tensor", None),
                     transpose=True,
                 ),
                 f"{source}.attn.proj.bias": WeightMapping(
                     target_path=f"{target}.attn.proj.bias",
-                    sharding=(),
+                    sharding=(None,),
                 ),
                 f"{source}.attn.sinks": WeightMapping(
                     target_path=f"{target}.attn.sinks",
-                    sharding=(),
+                    sharding=("tensor",),
                 ),
                 f"{source}.mlp.gate_proj.weight": WeightMapping(
-                    target_path=f"{target}.mlp.gate_proj.kernel",
+                    target_path=f"{target}.mlp.gate_proj.weight",
+                    sharding=(None, "tensor"),
                     transpose=True,
                 ),
                 f"{source}.mlp.gate_proj.bias": WeightMapping(
                     target_path=f"{target}.mlp.gate_proj.bias",
-                    sharding=(),
+                    sharding=("tensor",),
                 ),
                 f"{source}.mlp.up_proj.weight": WeightMapping(
-                    target_path=f"{target}.mlp.up_proj.kernel",
+                    target_path=f"{target}.mlp.up_proj.weight",
+                    sharding=(None, "tensor"),
                     transpose=True,
                 ),
                 f"{source}.mlp.up_proj.bias": WeightMapping(
                     target_path=f"{target}.mlp.up_proj.bias",
-                    sharding=(),
+                    sharding=("tensor",),
                 ),
                 f"{source}.mlp.down_proj.weight": WeightMapping(
-                    target_path=f"{target}.mlp.down_proj.kernel",
+                    target_path=f"{target}.mlp.down_proj.weight",
+                    sharding=("tensor", None),
                     transpose=True,
                 ),
                 f"{source}.mlp.down_proj.bias": WeightMapping(
                     target_path=f"{target}.mlp.down_proj.bias",
-                    sharding=(),
+                    sharding=(None,),
                 ),
             }
         )

@@ -77,6 +77,9 @@ class WeightMapping:
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
+    qkv_split_sizes: tuple[int, int, int] | None = None
+    qkv_split_replicas: tuple[int, int, int] | None = None
+    qkv_head_dim: int | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -107,6 +110,54 @@ class WeightMapping:
             return (None,)
         else:
             return (None,)
+
+
+def split_qkv_weight(
+    weight: jax.Array,
+    mapping: WeightMapping,
+    *,
+    is_bias: bool,
+) -> list[jax.Array]:
+    """Split a fused QKV tensor and replicate physical KV heads when required."""
+    if mapping.qkv_split_sizes is None:
+        raise ValueError("split_qkv_weight requires qkv_split_sizes")
+
+    q_dim, k_dim, v_dim = mapping.qkv_split_sizes
+    split_axis = 0 if is_bias or not mapping.transpose else 1
+    expected_size = q_dim + k_dim + v_dim
+    if weight.shape[split_axis] != expected_size:
+        raise ValueError(
+            f"Cannot split QKV tensor: axis {split_axis} has size {weight.shape[split_axis]}, "
+            f"expected {expected_size}."
+        )
+
+    offsets = (q_dim, q_dim + k_dim)
+    splits = list(jnp.split(weight, offsets, axis=split_axis))
+    replicas = mapping.qkv_split_replicas or (1, 1, 1)
+    if len(replicas) != len(splits):
+        raise ValueError(f"Expected three QKV replication factors, got {replicas}")
+
+    for idx, replica_count in enumerate(replicas):
+        if replica_count == 1:
+            continue
+        if replica_count < 1 or mapping.qkv_head_dim is None:
+            raise ValueError(
+                "QKV head replication requires positive factors and qkv_head_dim, got "
+                f"replicas={replicas}, head_dim={mapping.qkv_head_dim}."
+            )
+        head_dim = mapping.qkv_head_dim
+        split = splits[idx]
+        if is_bias:
+            split = split.reshape(-1, head_dim)
+            split = jnp.repeat(split, replica_count, axis=0).reshape(-1)
+        elif mapping.transpose:
+            split = split.reshape(split.shape[0], -1, head_dim)
+            split = jnp.repeat(split, replica_count, axis=1).reshape(split.shape[0], -1)
+        else:
+            split = split.reshape(-1, head_dim, split.shape[1])
+            split = jnp.repeat(split, replica_count, axis=0).reshape(-1, split.shape[-1])
+        splits[idx] = split
+    return splits
 
 
 class SequentialSafetensorManager:
@@ -2554,6 +2605,14 @@ class WeightLoader:
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
     ):
         jax_paths = mapping.target_path
+
+        if mapping.qkv_split_sizes is not None:
+            splits = split_qkv_weight(weight, mapping, is_bias=hf_key.endswith(".bias"))
+            for split_weight, jax_path in zip(splits, jax_paths):
+                model_param = self._get_param(params, jax_path)
+                sharded_weight = self._shard_weight(split_weight, mapping.sharding)
+                model_param[...] = sharded_weight.astype(model_param[...].dtype)
+            return
 
         v_head_dim = getattr(self, "v_head_dim", self.head_dim_original)
         v_head_dim_pad = (v_head_dim + 127) // 128 * 128 - v_head_dim

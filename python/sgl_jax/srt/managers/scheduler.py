@@ -1657,12 +1657,10 @@ class Scheduler(
             if not run_list:
                 continue
 
-            def fits(reqs) -> bool:
+            def fits(reqs, dp_rank=dp_rank) -> bool:
                 if not reqs:
                     return True
-                extend_tokens = sum(
-                    cdiv(r.extend_input_len, page_size) * page_size for r in reqs
-                )
+                extend_tokens = sum(cdiv(r.extend_input_len, page_size) * page_size for r in reqs)
                 num_tokens = extend_tokens + len(reqs) * page_size
                 # evict_from_tree_cache mutates the tree to free space; this is
                 # exactly what alloc_paged_token_slots_extend does before alloc,
@@ -1678,16 +1676,14 @@ class Scheduler(
             # Aborting chunked reqs mid-stream would corrupt their state and the
             # scheduler.chunked_reqs bookkeeping; they are already truncated to
             # fit, so only plain reqs are abort candidates.
-            chunked_set = {
-                id(r) for r in self.chunked_reqs if r is not None
-            } | {id(r) for r in adder.new_chunked_reqs if r is not None}
+            chunked_set = {id(r) for r in self.chunked_reqs if r is not None} | {
+                id(r) for r in adder.new_chunked_reqs if r is not None
+            }
 
             # Largest first: removing the biggest req frees the most and aborts
             # the fewest requests. Iterate a fixed snapshot (sorted by size) and
             # test membership, since run_list is mutated by remove() below.
-            candidates = sorted(
-                run_list, key=lambda r: r.extend_input_len, reverse=True
-            )
+            candidates = sorted(run_list, key=lambda r: r.extend_input_len, reverse=True)
             for req in candidates:
                 if fits(run_list):
                     break

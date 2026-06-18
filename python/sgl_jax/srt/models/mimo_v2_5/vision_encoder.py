@@ -9,8 +9,12 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.lax import Precision
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
 from transformers import modeling_flax_utils
+
+from sgl_jax.srt.layers.linear import LinearBase
 
 if TYPE_CHECKING:
     pass
@@ -174,6 +178,7 @@ class MiMoVisionAttention(nnx.Module):
         num_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        mesh: jax.sharding.Mesh,
         use_sink: bool = False,
         window_size: int | tuple[int, int] = -1,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -181,29 +186,67 @@ class MiMoVisionAttention(nnx.Module):
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        self.original_num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.use_sink = use_sink
         self.window_size = window_size
         self.scale = 1.0 / math.sqrt(head_dim)
+        self.mesh = mesh
 
-        _rngs = rngs or nnx.Rngs(0)
-        qkv_size = (num_heads + 2 * num_kv_heads) * head_dim
-        self.qkv = nnx.Linear(
-            hidden_size,
-            qkv_size,
-            use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+        tp_size = int(mesh.shape.get("tensor", 1))
+        kv_head_replicas = (
+            (tp_size + num_kv_heads - 1) // num_kv_heads if tp_size > num_kv_heads else 1
         )
-        self.proj = nnx.Linear(
-            num_heads * head_dim,
-            hidden_size,
+        self.num_kv_heads = num_kv_heads * kv_head_replicas
+        if num_heads % tp_size != 0 or self.num_kv_heads % tp_size != 0:
+            raise ValueError(
+                "MiMo vision physical attention heads must be divisible by tensor parallel size: "
+                f"num_heads={num_heads}, original_num_kv_heads={num_kv_heads}, "
+                f"physical_num_kv_heads={self.num_kv_heads}, tp_size={tp_size}."
+            )
+
+        self.q_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=num_heads * head_dim,
+            mesh=mesh,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
         )
-        self.sinks = nnx.Param(jnp.zeros((num_heads,), dtype=dtype)) if use_sink else None
+        self.k_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=self.num_kv_heads * head_dim,
+            mesh=mesh,
+            use_bias=True,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+        )
+        self.v_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=self.num_kv_heads * head_dim,
+            mesh=mesh,
+            use_bias=True,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+        )
+        self.proj = LinearBase(
+            input_size=num_heads * head_dim,
+            output_size=hidden_size,
+            mesh=mesh,
+            use_bias=True,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+        )
+        self.sinks = (
+            nnx.Param(
+                jax.device_put(
+                    jnp.zeros((num_heads,), dtype=dtype),
+                    NamedSharding(mesh, P("tensor")),
+                )
+            )
+            if use_sink
+            else None
+        )
 
     def __call__(
         self,
@@ -213,12 +256,26 @@ class MiMoVisionAttention(nnx.Module):
         full_attn: bool = False,
     ) -> jax.Array:
         seq_len = hidden_states.shape[0]
-        qkv = self.qkv(hidden_states)
-        q_size = self.num_heads * self.head_dim
-        kv_size = self.num_kv_heads * self.head_dim
-        query = qkv[:, :q_size].reshape(seq_len, self.num_heads, self.head_dim)
-        key = qkv[..., q_size : q_size + kv_size].reshape(seq_len, self.num_kv_heads, self.head_dim)
-        value = qkv[..., q_size + kv_size :].reshape(seq_len, self.num_kv_heads, self.head_dim)
+        head_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+        query, _ = self.q_proj(hidden_states, out_sharding=head_sharding)
+        key, _ = self.k_proj(hidden_states, out_sharding=head_sharding)
+        value, _ = self.v_proj(hidden_states, out_sharding=head_sharding)
+        q_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
+        query = jax.lax.reshape(
+            query,
+            (seq_len, self.num_heads, self.head_dim),
+            out_sharding=q_sharding,
+        )
+        key = jax.lax.reshape(
+            key,
+            (seq_len, self.num_kv_heads, self.head_dim),
+            out_sharding=q_sharding,
+        )
+        value = jax.lax.reshape(
+            value,
+            (seq_len, self.num_kv_heads, self.head_dim),
+            out_sharding=q_sharding,
+        )
 
         cos, sin = position_embeddings
         query, key = apply_rotary_pos_emb_vision(query, key, cos, sin)
@@ -269,8 +326,16 @@ class MiMoVisionAttention(nnx.Module):
         )
         attn_output = jnp.einsum("bnts,bnsh->bnth", attn_weights, v)  # [1, n, seq, h]
         attn_output = jnp.transpose(attn_output[0], (1, 0, 2))  # [seq, n, h]
-        attn_output = attn_output.reshape(seq_len, self.num_heads * self.head_dim)
-        return self.proj(attn_output)
+        attn_output = jax.lax.reshape(
+            attn_output,
+            (seq_len, self.num_heads * self.head_dim),
+            out_sharding=head_sharding,
+        )
+        output, _ = self.proj(
+            attn_output,
+            out_sharding=NamedSharding(self.mesh, P(None, None)),
+        )
+        return output
 
 
 class MiMoVisionSwiGLUMLP(nnx.Module):
@@ -278,36 +343,47 @@ class MiMoVisionSwiGLUMLP(nnx.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
+        mesh: jax.sharding.Mesh,
         hidden_act: str = "silu",
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs | None = None,
     ):
-        _rngs = rngs or nnx.Rngs(0)
-        self.gate_proj = nnx.Linear(
-            hidden_size,
-            intermediate_size,
+        self.mesh = mesh
+        self.gate_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=intermediate_size,
+            mesh=mesh,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
         )
-        self.up_proj = nnx.Linear(
-            hidden_size,
-            intermediate_size,
+        self.up_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=intermediate_size,
+            mesh=mesh,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
         )
-        self.down_proj = nnx.Linear(
-            intermediate_size,
-            hidden_size,
+        self.down_proj = LinearBase(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            mesh=mesh,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
         )
         self.act_fn = modeling_flax_utils.ACT2FN[hidden_act]
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        intermediate_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+        gate, _ = self.gate_proj(x, out_sharding=intermediate_sharding)
+        up, _ = self.up_proj(x, out_sharding=intermediate_sharding)
+        output, _ = self.down_proj(
+            self.act_fn(gate) * up,
+            out_sharding=NamedSharding(self.mesh, P(None, None)),
+        )
+        return output
 
 
 class MiMoVisionBlock(nnx.Module):
@@ -318,6 +394,7 @@ class MiMoVisionBlock(nnx.Module):
         num_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        mesh: jax.sharding.Mesh,
         hidden_act: str = "silu",
         norm_eps: float = 1e-6,
         use_sink: bool = False,
@@ -345,6 +422,7 @@ class MiMoVisionBlock(nnx.Module):
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            mesh=mesh,
             use_sink=use_sink,
             window_size=window_size,
             dtype=dtype,
@@ -353,6 +431,7 @@ class MiMoVisionBlock(nnx.Module):
         self.mlp = MiMoVisionSwiGLUMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            mesh=mesh,
             hidden_act=hidden_act,
             dtype=dtype,
             rngs=_rngs,
@@ -381,10 +460,12 @@ class MiMoVisionPatchMerger(nnx.Module):
         context_dim: int,
         norm_eps: float,
         spatial_merge_size: int,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs | None = None,
     ):
         self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.mesh = mesh
         _rngs = rngs or nnx.Rngs(0)
 
         self.ln_q = nnx.LayerNorm(
@@ -395,40 +476,45 @@ class MiMoVisionPatchMerger(nnx.Module):
             use_bias=False,
             rngs=_rngs,
         )
-        self.mlp_fc1 = nnx.Linear(
-            self.hidden_size,
-            self.hidden_size,
+        self.mlp_fc1 = LinearBase(
+            input_size=self.hidden_size,
+            output_size=self.hidden_size,
+            mesh=mesh,
             use_bias=False,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
         )
         self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
-        self.mlp_fc2 = nnx.Linear(
-            self.hidden_size,
-            out_hidden_size,
+        self.mlp_fc2 = LinearBase(
+            input_size=self.hidden_size,
+            output_size=out_hidden_size,
+            mesh=mesh,
             use_bias=False,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = self.ln_q(x)
         x = x.reshape(-1, self.hidden_size)
-        x = self.mlp_fc1(x)
+        x, _ = self.mlp_fc1(x, out_sharding=NamedSharding(self.mesh, P(None, "tensor")))
         x = self.mlp_act(x)
-        return self.mlp_fc2(x)
+        x, _ = self.mlp_fc2(x, out_sharding=NamedSharding(self.mesh, P(None, None)))
+        return x
 
 
 class MiMoVisionTransformer(nnx.Module):
     def __init__(
         self,
         config,
+        mesh: jax.sharding.Mesh,
         norm_eps: float = 1e-6,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs | None = None,
     ):
         _rngs = rngs or nnx.Rngs(0)
         self.config = config
+        self.mesh = mesh
         self.hidden_size = int(config.hidden_size)
         self.spatial_merge_size = int(config.spatial_merge_size)
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
@@ -460,6 +546,7 @@ class MiMoVisionTransformer(nnx.Module):
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
                     head_dim=head_dim,
+                    mesh=mesh,
                     hidden_act=getattr(config, "hidden_act", "silu"),
                     norm_eps=norm_eps,
                     use_sink=use_sink and i not in self.fullatt_block_indexes,
@@ -475,12 +562,14 @@ class MiMoVisionTransformer(nnx.Module):
             context_dim=self.hidden_size,
             norm_eps=norm_eps,
             spatial_merge_size=self.spatial_merge_size,
+            mesh=mesh,
             dtype=dtype,
             rngs=_rngs,
         )
 
     def _prepare_forward(self, pixel_values: jax.Array, grid_thw: tuple[tuple[int, int, int], ...]):
         hidden_states = self.patch_embed(pixel_values)
+        hidden_states = jax.sharding.reshard(hidden_states, NamedSharding(self.mesh, P()))
         rotary_pos_emb = mimo_vision_rot_pos_emb(
             grid_thw,
             spatial_merge_size=self.spatial_merge_size,
@@ -562,7 +651,8 @@ def load_weights_from_safetensors(model: nnx.Module, model_path: str, config) ->
     )
 
     weight_index = _index_safetensors(model_path)
-    mappings = create_mimo_vision_weight_mappings(config)
+    tp_size = int(model.mesh.shape.get("tensor", 1))
+    mappings = create_mimo_vision_weight_mappings(config, tp_size=tp_size)
     zero_filled: list[str] = []
     non_bias_missing: list[str] = []
     for hf_key, mapping in mappings.items():
@@ -580,7 +670,10 @@ def load_weights_from_safetensors(model: nnx.Module, model_path: str, config) ->
             weight = jnp.transpose(weight, mapping.transpose_axes)
         elif mapping.transpose:
             weight = jnp.transpose(weight, (1, 0))
-        _set_param(model, mapping.target_path, weight)
+        if isinstance(mapping.target_path, list):
+            _set_split_params(model, mapping, weight)
+        else:
+            _set_param(model, mapping.target_path, weight)
 
     if non_bias_missing:
         raise AssertionError(
@@ -613,7 +706,19 @@ def _set_param(model: nnx.Module, target_path: str | list[str], weight: jnp.ndar
     target[...] = weight.astype(target.dtype)
 
 
+def _set_split_params(model: nnx.Module, mapping, weight: jnp.ndarray) -> None:
+    from sgl_jax.srt.utils.weight_utils import split_qkv_weight
+
+    splits = split_qkv_weight(weight, mapping, is_bias=weight.ndim == 1)
+    for target_path, split_weight in zip(mapping.target_path, splits):
+        _set_param(model, target_path, split_weight)
+
+
 def _zero_param(model: nnx.Module, target_path: str | list[str]) -> None:
+    if isinstance(target_path, list):
+        for path in target_path:
+            _zero_param(model, path)
+        return
     target = _resolve_param(model, target_path)
     target[...] = jnp.zeros_like(target[...])
 
@@ -632,6 +737,8 @@ def _resolve_param(model: nnx.Module, target_path: str | list[str]):
 
 
 def _has_param(model: nnx.Module, target_path: str | list[str]) -> bool:
+    if isinstance(target_path, list):
+        return all(_has_param(model, path) for path in target_path)
     try:
         _resolve_param(model, target_path)
     except (AttributeError, TypeError, IndexError, KeyError):

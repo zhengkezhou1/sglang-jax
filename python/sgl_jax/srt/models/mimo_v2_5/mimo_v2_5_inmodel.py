@@ -78,6 +78,7 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
                 vision_config = vision_config.to_dict()
             self.visual = MiMoVisionTransformer(
                 MiMoVLVisionConfig.from_dict(vision_config),
+                mesh=mesh,
                 dtype=self.dtype,
                 rngs=rngs,
             )
@@ -187,10 +188,11 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
 
     def load_weights(self, model_config):
         """Two-pass load: (1) the FP8 AR backbone self-loads + post-load-dequants in place; (2) the
-        vision + audio towers load separately as bf16, fully replicated under the AR mesh (§3.3.5 /
-        §5.7 G2-a). G2-b: the FP8 quant path lives entirely in the AR's load_weights and only targets
-        model.layers.* / lm_head -- the towers (loaded here as plain .weight, no weight_q/scale) are
-        never wrapped in QuantizedLinear."""
+        vision + audio towers load separately as bf16. The audio tower retains its replicated
+        checkpoint layout; the vision transformer uses tensor-parallel linear weights. G2-b: the
+        FP8 quant path lives entirely in the AR's load_weights and only targets model.layers.* /
+        lm_head -- the towers (loaded here as plain .weight, no weight_q/scale) are never wrapped in
+        QuantizedLinear."""
         import copy
 
         from sgl_jax.srt.mm_core.weights import assert_replicated, replicate_mappings
@@ -205,23 +207,28 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
         # (1) FP8 AR backbone (model.* / lm_head.*) -- self-managed load + dequant.
         self.model.load_weights(model_config)
 
-        # (2) Towers (bf16, replicated). Skip build_text_embed_mapping -- the AR already provides
+        # (2) Towers (bf16). Skip build_text_embed_mapping -- the AR already provides
         # model.embed_tokens (text_embed reuses it in embed_mm). Audio mappings target audio_encoder.*
         # and vision visual.*, both of which are this wrapper's submodules.
-        tower_mappings = {}
-        tower_mappings.update(build_speech_embeddings_mapping(self.audio_encoder.audio_channels))
-        tower_mappings.update(
+        audio_mappings = {}
+        audio_mappings.update(build_speech_embeddings_mapping(self.audio_encoder.audio_channels))
+        audio_mappings.update(
             build_input_local_mapping(len(self.audio_encoder.input_local_transformer.layers))
         )
-        tower_mappings.update(build_projection_mapping())
+        audio_mappings.update(build_projection_mapping())
+        audio_mappings = replicate_mappings(audio_mappings)
+        assert_replicated(audio_mappings, where="MiMo-V2.5 audio tower")
+
+        tower_mappings = dict(audio_mappings)
         if self.visual is not None:
             tower_mappings.update(
                 create_mimo_vision_weight_mappings(
-                    self.visual.config, source_prefix="visual", target_prefix="visual."
+                    self.visual.config,
+                    source_prefix="visual",
+                    target_prefix="visual.",
+                    tp_size=int(self.mesh.shape.get("tensor", 1)),
                 )
             )
-        tower_mappings = replicate_mappings(tower_mappings)
-        assert_replicated(tower_mappings, where="MiMo-V2.5 vision + audio tower")
 
         # Strip the top-level fp8 quantization_config for the tower pass: the towers are bf16 and
         # leaving it set would make the loader treat .is_static_checkpoint on a plain dict / try fp8.

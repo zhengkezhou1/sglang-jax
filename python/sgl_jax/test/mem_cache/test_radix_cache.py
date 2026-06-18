@@ -739,9 +739,7 @@ class TestRadixCacheWithRequests(CustomTestCase):
         )
         return req_pool, allocator, cache
 
-    def _run_chunked_tail_retract(
-        self, page_size, pool_size, cache_protected_len_value
-    ):
+    def _run_chunked_tail_retract(self, page_size, pool_size, cache_protected_len_value):
         """Reproduce retraction-release of a request that finished a chunked,
         page-tail prefill and was decoding.
 
@@ -776,7 +774,7 @@ class TestRadixCacheWithRequests(CustomTestCase):
         full_indices = np.concatenate([match.device_indices, req_owned_indices])
         # The unaligned request-owned tail (one page) that the buggy code would
         # have folded into prefix_indices -> cache_protected_len.
-        unaligned_tail = req_owned_indices[: page_size]
+        unaligned_tail = req_owned_indices[:page_size]
         prefix_indices = np.concatenate([match.device_indices, unaligned_tail])
 
         req = MockRequest(
@@ -794,9 +792,7 @@ class TestRadixCacheWithRequests(CustomTestCase):
         req.kv_allocated_len = committed_kv_len
         req.last_matched_prefix_len = tree_len
         req.cache_protected_len = cache_protected_len_value
-        req_pool.write(
-            (req.req_pool_idx, slice(0, committed_kv_len)), full_indices
-        )
+        req_pool.write((req.req_pool_idx, slice(0, committed_kv_len)), full_indices)
 
         # 4) Retraction-release path: release_kv_cache(is_insert=False) ->
         #    cache_finished_req(is_insert=False) frees [old_prefix_len:aligned].
@@ -816,9 +812,7 @@ class TestRadixCacheWithRequests(CustomTestCase):
         )
 
         # Only the tree prefix remains held (protected); everything else freed.
-        self.assertEqual(
-            allocator.available_size(dp_rank=0), pool_size - tree_len
-        )
+        self.assertEqual(allocator.available_size(dp_rank=0), pool_size - tree_len)
         # The scheduler's leak invariant: available + evictable + protected == size.
         self.assertEqual(
             allocator.available_size(dp_rank=0)
@@ -856,9 +850,7 @@ class TestRadixCacheWithRequests(CustomTestCase):
         cache, allocator, tree_len = self._run_chunked_tail_retract(
             page_size, pool_size, cache_protected_len_value=tree_len
         )
-        self.assertEqual(
-            allocator.available_size(dp_rank=0), pool_size - tree_len
-        )
+        self.assertEqual(allocator.available_size(dp_rank=0), pool_size - tree_len)
         self.assertEqual(
             allocator.available_size(dp_rank=0)
             + cache.evictable_size(dp_rank=0)

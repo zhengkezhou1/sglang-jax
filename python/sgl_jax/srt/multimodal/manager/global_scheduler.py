@@ -507,4 +507,3 @@ def run_global_scheduler_process(
         traceback = get_exception_traceback()
         logger.error("GlobalScheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGQUIT)
-    return scheduler

@@ -907,9 +907,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # the fused embedding covers a resumed prefill's [0, seq_len) window after a KV
                 # retraction. output_ids is [] on the initial prefill (unchanged behavior); on
                 # resume it carries the decoded tokens (text-only; mm placeholders live in prompt).
-                ids_np = np.asarray(
-                    list(r.origin_input_ids) + list(r.output_ids), dtype=np.int32
-                )
+                ids_np = np.asarray(list(r.origin_input_ids) + list(r.output_ids), dtype=np.int32)
                 real_len = int(ids_np.shape[0])
                 if bucketing_on:
                     seq_bucket = _VISION_SEQ_BUCKET

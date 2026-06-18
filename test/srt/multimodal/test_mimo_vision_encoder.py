@@ -41,6 +41,7 @@ class TestMiMoVisionEncoderE2E(unittest.TestCase):
         with jax.set_mesh(cls.mesh):
             cls.jax_transformer = MiMoVisionTransformer(
                 cls.config,
+                mesh=cls.mesh,
                 norm_eps=1e-6,
                 dtype=jnp.float32,
                 rngs=nnx.Rngs(0),

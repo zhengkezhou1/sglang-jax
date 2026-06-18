@@ -18,11 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.managers.schedule_policy import (
-    CLIP_MAX_NEW_TOKENS_ESTIMATION,
-    AddReqResult,
-    PrefillAdder,
-)
+from sgl_jax.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sgl_jax.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import alloc_paged_token_slots_extend
@@ -46,9 +42,7 @@ def _mock_req(extend_input_len, max_new_tokens=8, dp_rank=0):
         swa_uuid_for_lock=None,
         last_matched_prefix_len=0,
         dp_rank=dp_rank,
-        sampling_params=SimpleNamespace(
-            max_new_tokens=max_new_tokens, ignore_eos=False
-        ),
+        sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens, ignore_eos=False),
     )
 
 
